@@ -1,0 +1,22 @@
+{
+  "alerts": [
+    {
+      "code": "WALTONHIL",
+      "direction": "above",
+      "target_price": 400.0,
+      "triggered": false
+    },
+    {
+      "code": "WALTONHIL",
+      "direction": "below",
+      "target_price": 390.0,
+      "triggered": true
+    },
+    {
+      "code": "WALTONHIL",
+      "direction": "below",
+      "target_price": 300.0,
+      "triggered": true
+    }
+  ]
+}

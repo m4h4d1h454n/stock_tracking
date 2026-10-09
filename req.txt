@@ -1,0 +1,3 @@
+python-telegram-bot==22.8
+bdshare>=1.2.5
+python-dotenv==1.0.1
