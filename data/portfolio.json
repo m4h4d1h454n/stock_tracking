@@ -48,6 +48,21 @@
       "side": "buy",
       "qty": 5.0,
       "price": 331.8
+    },
+    {
+      "ts": "2026-10-11T10:40:29",
+      "code": "WALTONHIL",
+      "side": "bonus",
+      "qty": 2.0,
+      "price": 0.0
+    }
+  ],
+  "dividends": [
+    {
+      "ts": "2026-10-11T10:40:02",
+      "code": "WALTONHIL",
+      "per_share": 18.0,
+      "qty": 20.0
     }
   ]
 }
