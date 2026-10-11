@@ -12,6 +12,8 @@ everything is stored in two small JSON files under `data/`.
 - **`portfolio.py`** — every buy/sell is appended to `data/portfolio.json`.
   Holdings, average cost, and realized P/L are all derived from that log,
   so the log is your single source of truth (and your audit trail).
+  Dividends live in the same file: cash dividends in a `dividends` list,
+  stock dividends as zero-cost `bonus` transactions.
 - **`alerts.py`** — price alerts (`above`/`below` a target) stored in
   `data/alerts.json`.
 - **`bot.py`** — the Telegram bot itself, plus a background job that
@@ -55,7 +57,29 @@ everything is stored in two small JSON files under `data/`.
 | `/alert CODE above\|below PRICE` | `/alert BRACBANK above 50` | Set a price alert |
 | `/alerts` | | List active alerts |
 | `/report` | | Realized + unrealized P/L summary |
-| `/history [CODE]` | `/history BRACBANK` | Recent transactions |
+| `/history [CODE]` | `/history BRACBANK` | Recent transactions and dividends |
+| `/dividends [CODE]` | `/dividends BRACBANK` | Dividends received (cash + bonus shares), with an ➕ Add button |
+| `/dividend CODE cash AMOUNT\|PCT% [QTY]` | `/dividend BRACBANK cash 1.5` | Log a cash dividend: ৳1.5 per share |
+| | `/dividend BRACBANK cash 15%` | …or 15% of face value (৳10 → ৳1.5/share) |
+| `/dividend CODE stock PCT% [QTY]` | `/dividend BRACBANK stock 10%` | Log a stock dividend: 1 bonus share per 10 held |
+
+The **💵 Dividends** menu button does the same thing with a guided flow
+(pick a holding → cash or stock → enter the value).
+
+### How dividends are counted
+
+- `QTY` is optional and defaults to the shares you hold right now. Pass it
+  if you held a different number on the record date, or no longer hold the
+  stock.
+- **Cash** dividends don't change your holdings or cost basis. They show up
+  in `/report` (*Dividends received*, and *Total return* = realized +
+  unrealized + dividends) and under `/portfolio`.
+- **Stock** dividends add whole bonus shares at ৳0 cost, so your average
+  cost per share drops (cost is unchanged, spread over more shares). The
+  bonus is rounded down to whole shares.
+- Enter the amount you actually received. If tax is deducted at source, use
+  the after-tax per-share figure.
+- Face value defaults to ৳10; set `DSE_FACE_VALUE` in `.env` to change it.
 
 ## Running it 24/7
 
@@ -102,5 +126,4 @@ sudo systemctl enable --now dse-bot
 
 - `/export` command to dump transactions as CSV
 - Daily auto-summary pushed every morning (another `job_queue.run_daily`)
-- Track dividends alongside buy/sell
 - Move from JSON files to SQLite if the transaction log grows large
