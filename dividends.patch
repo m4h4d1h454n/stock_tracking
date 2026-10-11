@@ -1,0 +1,646 @@
+diff --git a/README.md b/README.md
+index 82748ba..54e5650 100644
+--- a/README.md
++++ b/README.md
+@@ -12,6 +12,8 @@ everything is stored in two small JSON files under `data/`.
+ - **`portfolio.py`** — every buy/sell is appended to `data/portfolio.json`.
+   Holdings, average cost, and realized P/L are all derived from that log,
+   so the log is your single source of truth (and your audit trail).
++  Dividends live in the same file: cash dividends in a `dividends` list,
++  stock dividends as zero-cost `bonus` transactions.
+ - **`alerts.py`** — price alerts (`above`/`below` a target) stored in
+   `data/alerts.json`.
+ - **`bot.py`** — the Telegram bot itself, plus a background job that
+@@ -55,7 +57,29 @@ everything is stored in two small JSON files under `data/`.
+ | `/alert CODE above\|below PRICE` | `/alert BRACBANK above 50` | Set a price alert |
+ | `/alerts` | | List active alerts |
+ | `/report` | | Realized + unrealized P/L summary |
+-| `/history [CODE]` | `/history BRACBANK` | Recent transactions |
++| `/history [CODE]` | `/history BRACBANK` | Recent transactions and dividends |
++| `/dividends [CODE]` | `/dividends BRACBANK` | Dividends received (cash + bonus shares), with an ➕ Add button |
++| `/dividend CODE cash AMOUNT\|PCT% [QTY]` | `/dividend BRACBANK cash 1.5` | Log a cash dividend: ৳1.5 per share |
++| | `/dividend BRACBANK cash 15%` | …or 15% of face value (৳10 → ৳1.5/share) |
++| `/dividend CODE stock PCT% [QTY]` | `/dividend BRACBANK stock 10%` | Log a stock dividend: 1 bonus share per 10 held |
++
++The **💵 Dividends** menu button does the same thing with a guided flow
++(pick a holding → cash or stock → enter the value).
++
++### How dividends are counted
++
++- `QTY` is optional and defaults to the shares you hold right now. Pass it
++  if you held a different number on the record date, or no longer hold the
++  stock.
++- **Cash** dividends don't change your holdings or cost basis. They show up
++  in `/report` (*Dividends received*, and *Total return* = realized +
++  unrealized + dividends) and under `/portfolio`.
++- **Stock** dividends add whole bonus shares at ৳0 cost, so your average
++  cost per share drops (cost is unchanged, spread over more shares). The
++  bonus is rounded down to whole shares.
++- Enter the amount you actually received. If tax is deducted at source, use
++  the after-tax per-share figure.
++- Face value defaults to ৳10; set `DSE_FACE_VALUE` in `.env` to change it.
+ 
+ ## Running it 24/7
+ 
+@@ -102,5 +126,4 @@ sudo systemctl enable --now dse-bot
+ 
+ - `/export` command to dump transactions as CSV
+ - Daily auto-summary pushed every morning (another `job_queue.run_daily`)
+-- Track dividends alongside buy/sell
+ - Move from JSON files to SQLite if the transaction log grows large
+diff --git a/bot.py b/bot.py
+index a3fdea1..dc5019d 100644
+--- a/bot.py
++++ b/bot.py
+@@ -16,6 +16,7 @@ Interactive flows (via buttons):
+   🔴 Sell  → shows held codes → asks qty → asks price → logs sell
+   💰 Price → shows live prices for portfolio codes + "Other" button
+   🔍 Other → asks for a specific code → shows its price
++  💵 Dividends → shows dividends received + "➕ Add" → pick code → cash/stock → value
+ 
+ Slash commands (still available):
+   /buy CODE QTY PRICE
+@@ -26,6 +27,9 @@ Slash commands (still available):
+   /alerts
+   /report
+   /history [CODE]
++  /dividends [CODE]
++  /dividend CODE cash AMOUNT|PCT% [QTY]
++  /dividend CODE stock PCT% [QTY]
+   /cancel
+   /help
+ 
+@@ -79,6 +83,10 @@ _raw_authorized_id = os.getenv("AUTHORIZED_USER_ID", "").strip()
+ AUTHORIZED_USER_ID = int(_raw_authorized_id) if _raw_authorized_id else None
+ BOT_PASSWORD = os.getenv("BOT_PASSWORD")
+ 
++# Cash dividends on DSE are quoted as a % of face value (usually ৳10/share), so
++# "15%" cash = ৳1.5 per share. Override if you track a different face value.
++FACE_VALUE = float(os.getenv("DSE_FACE_VALUE", "10"))
++
+ logging.basicConfig(
+     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s", level=logging.INFO
+ )
+@@ -97,6 +105,7 @@ BTN_PORTFOLIO = "📊 Portfolio"
+ BTN_REPORT = "📈 Report"
+ BTN_ALERTS = "🔔 Alerts"
+ BTN_HISTORY = "📜 History"
++BTN_DIVIDEND = "💵 Dividends"
+ BTN_HELP = "❓ Help"
+ BTN_CANCEL = "❌ Cancel"
+ 
+@@ -105,7 +114,8 @@ MAIN_MENU_KEYBOARD = ReplyKeyboardMarkup(
+         [BTN_BUY, BTN_SELL],
+         [BTN_PRICE, BTN_PORTFOLIO],
+         [BTN_REPORT, BTN_ALERTS],
+-        [BTN_HISTORY, BTN_HELP],
++        [BTN_HISTORY, BTN_DIVIDEND],
++        [BTN_HELP],
+     ],
+     resize_keyboard=True,
+ )
+@@ -133,7 +143,7 @@ def pl_emoji(v: float) -> str:
+ 
+ def clear_flow(context: ContextTypes.DEFAULT_TYPE) -> None:
+     """Wipe any in-progress interactive flow for this user."""
+-    for key in ("flow", "flow_code", "flow_qty"):
++    for key in ("flow", "flow_code", "flow_qty", "flow_kind"):
+         context.user_data.pop(key, None)
+ 
+ 
+@@ -242,6 +252,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+         "/alerts\n"
+         "/report\n"
+         "/history [CODE]\n"
++        "/dividends [CODE]\n"
++        "/dividend CODE cash AMOUNT|PCT% [QTY]\n"
++        "/dividend CODE stock PCT% [QTY]\n"
+         "/cancel — cancel current flow\n",
+         parse_mode=ParseMode.MARKDOWN,
+         reply_markup=MAIN_MENU_KEYBOARD,
+@@ -330,6 +343,9 @@ def build_portfolio_text() -> str | None:
+     lines.append("")
+     lines.append(f"Cost: {fmt_money(total_cost)}  |  Value: {fmt_money(total_value)}")
+     lines.append(f"{pl_emoji(total_upl)} Unrealized P/L: {fmt_money(total_upl)}")
++    total_div = portfolio.get_dividend_total()
++    if total_div:
++        lines.append(f"💵 Dividends received: {fmt_money(total_div)}")
+ 
+     return "\n".join(lines)
+ 
+@@ -747,6 +763,9 @@ def build_report_text() -> str:
+         if live:
+             unrealized += (live.ltp - h.avg_cost) * h.qty
+ 
++    dividends = portfolio.get_dividend_total()
++    total_return = realized + unrealized + dividends
++
+     total_tx = len(portfolio.get_transactions())
+     lines = [
+         "*Portfolio Report*",
+@@ -755,7 +774,8 @@ def build_report_text() -> str:
+         "",
+         f"Realized P/L: {fmt_money(realized)}",
+         f"Unrealized P/L: {fmt_money(unrealized)}",
+-        f"{pl_emoji(realized + unrealized)} Total P/L: {fmt_money(realized + unrealized)}",
++        f"Dividends received: {fmt_money(dividends)}",
++        f"{pl_emoji(total_return)} Total return: {fmt_money(total_return)}",
+     ]
+     return "\n".join(lines)
+ 
+@@ -779,22 +799,239 @@ async def cb_refresh_report(update: Update, context: ContextTypes.DEFAULT_TYPE)
+     )
+ 
+ 
++def _fmt_tx_line(t) -> str:
++    if t.side == "bonus":
++        return f"{t.ts}  BONUS {t.code:10}  +{t.qty:g} shares (stock dividend)"
++    return f"{t.ts}  {t.side.upper():5} {t.code:10}  {t.qty:g} @ {fmt_money(t.price)}"
++
++
++def _fmt_div_line(d) -> str:
++    return (
++        f"{d.ts}  CASH  {d.code:10}  {d.qty:g} x {fmt_money(d.per_share)} "
++        f"= {fmt_money(d.total)}"
++    )
++
++
+ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+     clear_flow(context)
+     code = context.args[0].upper() if context.args else None
+-    txs = portfolio.get_transactions(code=code, limit=15)
+-    if not txs:
++    entries = [(t.ts, _fmt_tx_line(t)) for t in portfolio.get_transactions(code=code)]
++    entries += [(d.ts, _fmt_div_line(d)) for d in portfolio.get_dividends(code=code)]
++    if not entries:
+         await update.message.reply_text("No transactions found.")
+         return
+-    lines = [
+-        f"{t.ts}  {t.side.upper():4}  {t.code:10}  {t.qty:g} @ {fmt_money(t.price)}"
+-        for t in txs
+-    ]
++    entries.sort(key=lambda e: e[0], reverse=True)
++    lines = [line for _, line in entries[:15]]
+     await update.message.reply_text(
+         "```\n" + "\n".join(lines) + "\n```", parse_mode=ParseMode.MARKDOWN
+     )
+ 
+ 
++# ---------------------------------------------------------------- DIVIDENDS
++
++def apply_dividend(code: str, kind: str, raw: str, qty: float | None = None) -> str:
++    """
++    Record a dividend and return the confirmation text. Raises ValueError with
++    a user-readable message on bad input. Shared by /dividend and the guided flow.
++
++      cash : "1.5" = ৳1.5 per share, "15%" = 15% of face value (FACE_VALUE)
++      stock: "10" or "10%" = 10 bonus shares per 100 held (rounded down)
++    """
++    code = code.upper()
++    kind = kind.lower()
++    raw = raw.strip()
++    is_pct = raw.endswith("%")
++    try:
++        num = float(raw.rstrip("%").strip())
++    except ValueError:
++        raise ValueError("Send a number, e.g. 1.5 or 15%") from None
++    if num <= 0:
++        raise ValueError("The value must be positive.")
++
++    if kind == "cash":
++        per_share = num / 100 * FACE_VALUE if is_pct else num
++        d = portfolio.add_cash_dividend(code, per_share, qty)
++        return (
++            f"✅ Cash dividend: {d.code} — {d.qty:g} shares x {fmt_money(d.per_share)} "
++            f"= {fmt_money(d.total)}"
++        )
++    if kind == "stock":
++        tx = portfolio.add_stock_dividend(code, num, qty)
++        h = portfolio.get_holding(code)
++        return (
++            f"✅ Stock dividend: +{tx.qty:g} bonus {tx.code} shares ({num:g}%).\n"
++            f"You now hold {h.qty:g} @ avg {fmt_money(h.avg_cost)}"
++        )
++    raise ValueError("Type must be 'cash' or 'stock'.")
++
++
++def build_dividends_text(code: str | None = None) -> str:
++    divs = portfolio.get_dividends(code=code)
++    bonuses = [t for t in portfolio.get_transactions(code=code) if t.side == "bonus"]
++    if not divs and not bonuses:
++        return "No dividends recorded yet." + (f" ({code})" if code else "")
++
++    cash_by_code: dict[str, float] = {}
++    for d in divs:
++        cash_by_code[d.code] = cash_by_code.get(d.code, 0.0) + d.total
++    bonus_by_code: dict[str, float] = {}
++    for t in bonuses:
++        bonus_by_code[t.code] = bonus_by_code.get(t.code, 0.0) + t.qty
++
++    lines = ["*💵 Dividends*\n"]
++    for c in sorted(set(cash_by_code) | set(bonus_by_code)):
++        parts = []
++        if c in cash_by_code:
++            parts.append(f"{fmt_money(cash_by_code[c])} cash")
++        if c in bonus_by_code:
++            parts.append(f"+{bonus_by_code[c]:g} bonus shares")
++        lines.append(f"*{c}*: " + ", ".join(parts))
++    lines.append("")
++    lines.append(f"Total cash received: {fmt_money(sum(cash_by_code.values()))}")
++
++    recent = [(d.ts, _fmt_div_line(d)) for d in divs] + [(t.ts, _fmt_tx_line(t)) for t in bonuses]
++    recent.sort(key=lambda e: e[0], reverse=True)
++    lines.append("\n```\n" + "\n".join(line for _, line in recent[:10]) + "\n```")
++    return "\n".join(lines)
++
++
++def add_dividend_keyboard() -> InlineKeyboardMarkup:
++    return InlineKeyboardMarkup(
++        [[InlineKeyboardButton("➕ Add dividend", callback_data="div_add")]]
++    )
++
++
++async def cmd_dividends(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
++    """💵 Dividends button, /dividends [CODE], and bare /dividend."""
++    clear_flow(context)
++    code = context.args[0].upper() if context.args else None
++    await update.message.reply_text(
++        build_dividends_text(code),
++        parse_mode=ParseMode.MARKDOWN,
++        reply_markup=add_dividend_keyboard(),
++    )
++
++
++async def cmd_dividend(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
++    """/dividend CODE cash AMOUNT|PCT% [QTY]   or   /dividend CODE stock PCT% [QTY]"""
++    clear_flow(context)
++    if not context.args:
++        await cmd_dividends(update, context)
++        return
++    try:
++        code, kind, raw = context.args[0], context.args[1].lower(), context.args[2]
++        qty = float(context.args[3]) if len(context.args) > 3 else None
++        if kind not in ("cash", "stock"):
++            raise ValueError
++    except (IndexError, ValueError):
++        await update.message.reply_text(
++            "Usage:\n"
++            "/dividend CODE cash AMOUNT|PCT% [QTY]\n"
++            "/dividend CODE stock PCT% [QTY]\n\n"
++            "e.g. /dividend BRACBANK cash 1.5  (৳1.5 per share)\n"
++            f"/dividend BRACBANK cash 15%  (15% of ৳{FACE_VALUE:g} face value)\n"
++            "/dividend BRACBANK stock 10%  (1 bonus share per 10 held)\n\n"
++            "QTY is optional — it defaults to the shares you hold now."
++        )
++        return
++    try:
++        text = apply_dividend(code, kind, raw, qty)
++    except ValueError as e:
++        await update.message.reply_text(f"⚠️ {e}")
++        return
++    await update.message.reply_text(text, reply_markup=MAIN_MENU_KEYBOARD)
++
++
++def dividend_pick_view() -> tuple[str, InlineKeyboardMarkup | None]:
++    holdings = portfolio.get_holdings()
++    if not holdings:
++        return (
++            "You don't hold any positions yet. For a stock you no longer hold, use "
++            "/dividend CODE cash AMOUNT QTY.",
++            None,
++        )
++    buttons = [
++        [InlineKeyboardButton(f"{code}  ({h.qty:g})", callback_data=f"div_pick:{code}")]
++        for code, h in sorted(holdings.items())
++    ]
++    return "💵 *Dividend — pick a code*\n\nChoose one of your holdings:", InlineKeyboardMarkup(buttons)
++
++
++async def cb_div_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
++    query = update.callback_query
++    await query.answer()
++    text, markup = dividend_pick_view()
++    await context.bot.send_message(
++        chat_id=query.message.chat_id,
++        text=text,
++        parse_mode=ParseMode.MARKDOWN,
++        reply_markup=markup,
++    )
++
++
++async def cb_div_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
++    query = update.callback_query
++    code = query.data.split(":", 1)[1]
++    h = portfolio.get_holdings().get(code)
++    if not h:
++        await query.answer("You no longer hold this code.", show_alert=True)
++        return
++    await query.answer()
++    await query.edit_message_text(
++        f"💵 *Dividend — {code}* (you hold {h.qty:g})\n\nWhat kind of dividend?",
++        parse_mode=ParseMode.MARKDOWN,
++        reply_markup=InlineKeyboardMarkup(
++            [[
++                InlineKeyboardButton("💵 Cash", callback_data=f"div_kind:cash:{code}"),
++                InlineKeyboardButton("🎁 Stock (bonus shares)", callback_data=f"div_kind:stock:{code}"),
++            ]]
++        ),
++    )
++
++
++async def cb_div_kind(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
++    query = update.callback_query
++    _, kind, code = query.data.split(":", 2)
++    h = portfolio.get_holdings().get(code)
++    if not h:
++        await query.answer("You no longer hold this code.", show_alert=True)
++        return
++    context.user_data["flow"] = "div_value"
++    context.user_data["flow_code"] = code
++    context.user_data["flow_kind"] = kind
++    await query.answer()
++    if kind == "cash":
++        prompt = (
++            f"Send the *cash dividend per share* in ৳ (e.g. `1.5`), or as a % of "
++            f"face value (e.g. `15%` = ৳{15 / 100 * FACE_VALUE:g} on a ৳{FACE_VALUE:g} share)."
++        )
++    else:
++        prompt = "Send the *stock dividend %* (e.g. `10%` = 1 bonus share per 10 held)."
++    await query.edit_message_text(
++        f"💵 *{kind.title()} dividend — {code}* (you hold {h.qty:g})",
++        parse_mode=ParseMode.MARKDOWN,
++    )
++    await context.bot.send_message(
++        chat_id=query.message.chat_id,
++        text=prompt,
++        parse_mode=ParseMode.MARKDOWN,
++        reply_markup=CANCEL_KEYBOARD,
++    )
++
++
++async def dividend_got_value(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
++    code = context.user_data.get("flow_code")
++    kind = context.user_data.get("flow_kind")
++    try:
++        text = apply_dividend(code, kind, update.message.text)
++    except ValueError as e:
++        # keep the flow open so the user can retry or tap Cancel
++        await update.message.reply_text(f"⚠️ {e}\nTry again, or tap ❌ Cancel.")
++        return
++    clear_flow(context)
++    await update.message.reply_text(text, reply_markup=MAIN_MENU_KEYBOARD)
++
++
+ # ---------------------------------------------------------------- routers
+ 
+ async def cb_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+@@ -811,6 +1048,12 @@ async def cb_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+         await cb_delete_alert(update, context)
+     elif data.startswith("sell_pick:"):
+         await cb_sell_pick(update, context)
++    elif data == "div_add":
++        await cb_div_add(update, context)
++    elif data.startswith("div_pick:"):
++        await cb_div_pick(update, context)
++    elif data.startswith("div_kind:"):
++        await cb_div_kind(update, context)
+     elif data == "price_other":
+         await update.callback_query.answer()
+         await start_other_flow_cb(update, context)
+@@ -866,6 +1109,8 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
+         await cmd_alerts(update, context)
+     elif text == BTN_HISTORY:
+         await cmd_history(update, context)
++    elif text == BTN_DIVIDEND:
++        await cmd_dividends(update, context)
+     elif text == BTN_HELP:
+         await cmd_help(update, context)
+ 
+@@ -886,6 +1131,8 @@ async def flow_text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -
+         await sell_got_price(update, context)
+     elif flow == "price_other":
+         await price_other_got_code(update, context)
++    elif flow == "div_value":
++        await dividend_got_value(update, context)
+     # else: no flow active — ignore
+ 
+ 
+@@ -956,6 +1203,8 @@ def main() -> None:
+     app.add_handler(CommandHandler("alerts", cmd_alerts))
+     app.add_handler(CommandHandler("report", cmd_report))
+     app.add_handler(CommandHandler("history", cmd_history))
++    app.add_handler(CommandHandler("dividend", cmd_dividend))
++    app.add_handler(CommandHandler("dividends", cmd_dividends))
+ 
+     # --- Inline buttons ---
+     app.add_handler(CallbackQueryHandler(cb_router))
+@@ -964,7 +1213,7 @@ def main() -> None:
+     menu_labels = "|".join(
+         [
+             BTN_BUY, BTN_SELL, BTN_PRICE, BTN_PORTFOLIO,
+-            BTN_REPORT, BTN_ALERTS, BTN_HISTORY, BTN_HELP, BTN_CANCEL,
++            BTN_REPORT, BTN_ALERTS, BTN_HISTORY, BTN_DIVIDEND, BTN_HELP, BTN_CANCEL,
+         ]
+     )
+     app.add_handler(MessageHandler(filters.Regex(f"^({menu_labels})$"), menu_router))
+diff --git a/portfolio.py b/portfolio.py
+index 02b0b2a..c3a44ef 100644
+--- a/portfolio.py
++++ b/portfolio.py
+@@ -1,25 +1,37 @@
+ """
+ portfolio.py
+-Tracks buy/sell transactions and current holdings for one user, persisted
+-to a plain JSON file (data/portfolio.json). No database server needed.
++Tracks buy/sell transactions, dividends and current holdings for one user,
++persisted to a plain JSON file (data/portfolio.json). No database server needed.
+ 
+ Data shape:
+ {
+   "transactions": [
+     {"ts": "2026-09-17T10:30:00", "code": "BRACBANK", "side": "buy",
+      "qty": 100, "price": 45.5},
++    {"ts": "2026-10-01T09:00:00", "code": "BRACBANK", "side": "bonus",
++     "qty": 10, "price": 0.0},          # stock dividend (bonus shares)
++    ...
++  ],
++  "dividends": [                         # cash dividends
++    {"ts": "2026-10-05T12:00:00", "code": "BRACBANK",
++     "per_share": 1.5, "qty": 110},
+     ...
+   ]
+ }
+ 
+ Holdings (qty, avg cost) are derived from transactions on the fly, so the
+ transaction log is always the single source of truth — good for reports
+-and auditing.
++and auditing. Stock dividends are logged as zero-cost "bonus" transactions
++so they flow through the same average-cost maths; cash dividends live in
++their own list because they don't change what you hold.
++
++Files written before dividends existed have no "dividends" key and load fine.
+ """
+ 
+ from __future__ import annotations
+ 
+ import json
++import math
+ import os
+ from dataclasses import dataclass, field
+ from datetime import datetime
+@@ -42,6 +54,19 @@ class Transaction:
+         return self.qty * self.price
+ 
+ 
++@dataclass
++class Dividend:
++    """A cash dividend received: `qty` shares x `per_share` taka."""
++    ts: str
++    code: str
++    per_share: float
++    qty: float
++
++    @property
++    def total(self) -> float:
++        return self.qty * self.per_share
++
++
+ @dataclass
+ class Holding:
+     code: str
+@@ -54,6 +79,7 @@ class Portfolio:
+     def __init__(self, path: str = DATA_FILE):
+         self.path = path
+         self._transactions: List[Transaction] = []
++        self._dividends: List[Dividend] = []
+         self._load()
+ 
+     # ---------- persistence ----------
+@@ -66,10 +92,14 @@ class Portfolio:
+         with open(self.path, "r") as f:
+             raw = json.load(f)
+         self._transactions = [Transaction(**t) for t in raw.get("transactions", [])]
++        self._dividends = [Dividend(**d) for d in raw.get("dividends", [])]
+ 
+     def _save(self) -> None:
+         os.makedirs(DATA_DIR, exist_ok=True)
+-        payload = {"transactions": [vars(t) for t in self._transactions]}
++        payload = {
++            "transactions": [vars(t) for t in self._transactions],
++            "dividends": [vars(d) for d in self._dividends],
++        }
+         with open(self.path, "w") as f:
+             json.dump(payload, f, indent=2)
+ 
+@@ -98,37 +128,97 @@ class Portfolio:
+         self._save()
+         return tx
+ 
++    # ---------- dividends ----------
++
++    def add_cash_dividend(self, code: str, per_share: float, qty: Optional[float] = None,
++                          ts: Optional[str] = None) -> Dividend:
++        """Record a cash dividend. `qty` defaults to the shares you hold now."""
++        code = code.upper()
++        if per_share <= 0:
++            raise ValueError("dividend per share must be positive")
++        if qty is None:
++            qty = self.get_holding(code).qty
++        if qty <= 0:
++            raise ValueError(
++                f"You don't hold any {code}. If you held it on the record date, "
++                f"pass the share count explicitly."
++            )
++        div = Dividend(ts=ts or datetime.now().isoformat(timespec="seconds"),
++                       code=code, per_share=per_share, qty=qty)
++        self._dividends.append(div)
++        self._save()
++        return div
++
++    def add_stock_dividend(self, code: str, pct: float, qty: Optional[float] = None,
++                           ts: Optional[str] = None) -> Transaction:
++        """
++        Record a stock dividend of `pct` percent (10 => 1 bonus share per 10
++        held). Whole shares only: the bonus is rounded down. `qty` defaults to
++        the shares you hold now. Logged as a zero-cost "bonus" transaction,
++        which lowers your average cost per share.
++        """
++        code = code.upper()
++        if pct <= 0:
++            raise ValueError("stock dividend % must be positive")
++        if qty is None:
++            qty = self.get_holding(code).qty
++        if qty <= 0:
++            raise ValueError(
++                f"You don't hold any {code}. If you held it on the record date, "
++                f"pass the share count explicitly."
++            )
++        bonus = math.floor(qty * pct / 100 + 1e-9)
++        if bonus < 1:
++            raise ValueError(
++                f"{pct:g}% of {qty:g} shares is less than one whole bonus share."
++            )
++        tx = Transaction(ts=ts or datetime.now().isoformat(timespec="seconds"),
++                         code=code, side="bonus", qty=float(bonus), price=0.0)
++        self._transactions.append(tx)
++        self._save()
++        return tx
++
++    def get_dividends(self, code: Optional[str] = None, limit: Optional[int] = None) -> List[Dividend]:
++        divs = self._dividends
++        if code:
++            divs = [d for d in divs if d.code == code.upper()]
++        divs = sorted(divs, key=lambda d: d.ts, reverse=True)
++        return divs[:limit] if limit else divs
++
++    def get_dividend_total(self, code: Optional[str] = None) -> float:
++        return sum(d.total for d in self.get_dividends(code))
++
++    def get_dividend_totals_by_code(self) -> Dict[str, float]:
++        totals: Dict[str, float] = {}
++        for d in self._dividends:
++            totals[d.code] = totals.get(d.code, 0.0) + d.total
++        return totals
++
+     # ---------- derived views ----------
+ 
+-    def get_holdings(self) -> Dict[str, Holding]:
++    def _replay(self) -> Dict[str, Holding]:
++        """Replay the log into per-code holdings (closed positions included)."""
+         holdings: Dict[str, Holding] = {}
+         for tx in self._transactions:
+             h = holdings.setdefault(tx.code, Holding(code=tx.code))
+-            if tx.side == "buy":
++            if tx.side in ("buy", "bonus"):  # bonus = a buy at price 0
+                 new_qty = h.qty + tx.qty
+                 h.avg_cost = ((h.avg_cost * h.qty) + (tx.price * tx.qty)) / new_qty if new_qty else 0
+                 h.qty = new_qty
+             else:  # sell
+                 h.realized_pl += (tx.price - h.avg_cost) * tx.qty
+                 h.qty -= tx.qty
++        return holdings
++
++    def get_holdings(self) -> Dict[str, Holding]:
+         # drop fully-closed positions from "current holdings"
+-        return {c: h for c, h in holdings.items() if h.qty > 1e-9}
++        return {c: h for c, h in self._replay().items() if h.qty > 1e-9}
+ 
+     def get_holding(self, code: str) -> Holding:
+         return self.get_holdings().get(code.upper(), Holding(code=code.upper()))
+ 
+     def get_realized_pl_total(self) -> float:
+-        holdings: Dict[str, Holding] = {}
+-        for tx in self._transactions:
+-            h = holdings.setdefault(tx.code, Holding(code=tx.code))
+-            if tx.side == "buy":
+-                new_qty = h.qty + tx.qty
+-                h.avg_cost = ((h.avg_cost * h.qty) + (tx.price * tx.qty)) / new_qty if new_qty else 0
+-                h.qty = new_qty
+-            else:
+-                h.realized_pl += (tx.price - h.avg_cost) * tx.qty
+-                h.qty -= tx.qty
+-        return sum(h.realized_pl for h in holdings.values())
++        return sum(h.realized_pl for h in self._replay().values())
+ 
+     def get_transactions(self, code: Optional[str] = None, limit: Optional[int] = None) -> List[Transaction]:
+         txs = self._transactions
