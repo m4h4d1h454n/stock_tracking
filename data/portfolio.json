@@ -34,6 +34,20 @@
       "side": "buy",
       "qty": 10.0,
       "price": 86.0
+    },
+    {
+      "ts": "2026-10-08T14:41:00",
+      "code": "UPGDCL",
+      "side": "buy",
+      "qty": 10.0,
+      "price": 113.5
+    },
+    {
+      "ts": "2026-10-08T14:42:49",
+      "code": "WALTONHIL",
+      "side": "buy",
+      "qty": 5.0,
+      "price": 331.8
     }
   ]
 }
